@@ -2,9 +2,12 @@
 """
 AI Music Parody Generator - Backend Server
 
-Phase 1: Foundation
+Phase 1-2: Foundation + Audio Analysis
 - FastAPI server setup
 - GPU detection
+- Audio file handling
+- Voice separation (Demucs)
+- BPM detection
 - Health check endpoints
 """
 
@@ -20,21 +23,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 try:
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse
+    from fastapi import FastAPI, File, UploadFile, HTTPException
+    from fastapi.responses import JSONResponse, FileResponse
+    from fastapi.middleware.cors import CORSMiddleware
     import torch
     import uvicorn
+    import librosa
+    import numpy as np
 except ImportError as e:
     logger.error(f"Missing dependency: {e}")
-    logger.error("Run: pip install -r requirements/base.txt")
+    logger.error("Run: pip install fastapi uvicorn pydantic torch librosa numpy scipy")
     sys.exit(1)
 
 # Initialize FastAPI app
 app = FastAPI(
     title="AI Music Parody Generator",
     description="Professional AI-powered music parody generation",
-    version="0.1.0"
+    version="0.2.0"
 )
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create cache directory
+CACHE_DIR = Path("data/cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class GPUInfo:
@@ -73,14 +92,98 @@ class GPUInfo:
         return info
 
 
+class AudioProcessor:
+    """Audio processing utilities"""
+    
+    SAMPLE_RATE = 44100
+    
+    @staticmethod
+    def load_audio(file_path: str, sr: int = SAMPLE_RATE) -> tuple:
+        """Load audio file"""
+        try:
+            y, sr = librosa.load(file_path, sr=sr, mono=False)
+            return y, sr
+        except Exception as e:
+            logger.error(f"Error loading audio: {e}")
+            raise
+    
+    @staticmethod
+    def get_audio_info(file_path: str) -> dict:
+        """Get audio file info"""
+        try:
+            y, sr = librosa.load(file_path, sr=None, mono=False)
+            duration = librosa.get_duration(y=y, sr=sr)
+            
+            return {
+                "sample_rate": sr,
+                "duration_seconds": float(duration),
+                "num_channels": 1 if y.ndim == 1 else y.shape[0],
+                "total_samples": y.shape[0] if y.ndim == 1 else y.shape[1]
+            }
+        except Exception as e:
+            logger.error(f"Error getting audio info: {e}")
+            raise
+    
+    @staticmethod
+    def detect_bpm(file_path: str) -> dict:
+        """Detect BPM using librosa"""
+        try:
+            y, sr = librosa.load(file_path, sr=None, mono=True)
+            
+            # Compute onset strength
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+            
+            # Estimate tempo
+            tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+            
+            return {
+                "bpm": float(tempo),
+                "beats": beats.tolist(),
+                "num_beats": len(beats)
+            }
+        except Exception as e:
+            logger.error(f"Error detecting BPM: {e}")
+            raise
+    
+    @staticmethod
+    def get_spectral_info(file_path: str) -> dict:
+        """Get spectral information"""
+        try:
+            y, sr = librosa.load(file_path, sr=None, mono=True)
+            
+            # Compute STFT
+            S = librosa.stft(y)
+            S_db = librosa.power_to_db(np.abs(S)**2, ref=np.max)
+            
+            # Compute spectral centroid
+            centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+            
+            return {
+                "freq_range": [0, sr/2],
+                "spectral_centroid_mean": float(np.mean(centroid)),
+                "spectral_centroid_std": float(np.std(centroid))
+            }
+        except Exception as e:
+            logger.error(f"Error getting spectral info: {e}")
+            raise
+
+
+# ==================== API ENDPOINTS ====================
+
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
         "app": "AI Music Parody Generator",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "status": "running",
-        "phase": "Phase 1 - Foundation"
+        "phase": "Phase 2 - Audio Analysis",
+        "features": [
+            "Audio file upload",
+            "BPM detection",
+            "Audio analysis",
+            "Voice separation (coming soon)"
+        ]
     }
 
 
@@ -98,13 +201,20 @@ async def system_info():
     """Get system information including GPU status"""
     return {
         "system": "AI Music Parody Generator",
-        "phase": "Phase 1 - Foundation",
+        "phase": "Phase 2 - Audio Analysis",
         "gpu": GPUInfo.get_info(),
         "python_version": sys.version.split()[0],
+        "librosa_available": True,
         "available_endpoints": [
             "/",
             "/health",
             "/api/v1/system/info",
+            "/api/v1/gpu/info",
+            "/api/v1/test/gpu",
+            "/api/v1/audio/upload",
+            "/api/v1/audio/info",
+            "/api/v1/audio/bpm",
+            "/api/v1/audio/analysis",
             "/docs",
             "/redoc"
         ]
@@ -144,11 +254,111 @@ async def test_gpu():
         )
 
 
+@app.post("/api/v1/audio/upload")
+async def upload_audio(file: UploadFile = File(...)):
+    """Upload audio file"""
+    try:
+        # Save file
+        file_path = CACHE_DIR / file.filename
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Audio uploaded: {file.filename} ({len(content)} bytes)")
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "size_bytes": len(content),
+            "path": str(file_path)
+        }
+    except Exception as e:
+        logger.error(f"Error uploading audio: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/audio/info")
+async def audio_info(file: UploadFile = File(...)):
+    """Get audio file information"""
+    try:
+        # Save temporarily
+        file_path = CACHE_DIR / file.filename
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Get info
+        info = AudioProcessor.get_audio_info(str(file_path))
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "audio_info": info
+        }
+    except Exception as e:
+        logger.error(f"Error getting audio info: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/audio/bpm")
+async def detect_bpm(file: UploadFile = File(...)):
+    """Detect BPM from audio file"""
+    try:
+        # Save temporarily
+        file_path = CACHE_DIR / file.filename
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Detecting BPM for: {file.filename}")
+        
+        # Detect BPM
+        bpm_info = AudioProcessor.detect_bpm(str(file_path))
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "bpm": bpm_info
+        }
+    except Exception as e:
+        logger.error(f"Error detecting BPM: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/audio/analysis")
+async def analyze_audio(file: UploadFile = File(...)):
+    """Comprehensive audio analysis"""
+    try:
+        # Save temporarily
+        file_path = CACHE_DIR / file.filename
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Analyzing audio: {file.filename}")
+        
+        # Get all info
+        audio_info = AudioProcessor.get_audio_info(str(file_path))
+        bpm_info = AudioProcessor.detect_bpm(str(file_path))
+        spectral_info = AudioProcessor.get_spectral_info(str(file_path))
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "audio": audio_info,
+            "rhythm": bpm_info,
+            "spectral": spectral_info
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing audio: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 if __name__ == "__main__":
-    logger.info("""\n
-╔══════════════════════════════════════════════════════╗
+    logger.info("""
+╔══════════════════════════════════════════════════════╝
 ║  AI Music Parody Generator - Backend Server         ║
-║  Phase 1: Foundation                                ║
+║  Phase 2: Audio Analysis                            ║
 ╚══════════════════════════════════════════════════════╝
     """)
     
