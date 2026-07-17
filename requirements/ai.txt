@@ -1,0 +1,9 @@
+# AI/ML dependencies
+-r audio.txt
+
+torch==2.0.2
+torchvision==0.15.2
+julius==0.2.7
+crepe==0.0.15
+huggingface-hub==0.19.4
+numba==0.57.1
